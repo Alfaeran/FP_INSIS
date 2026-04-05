@@ -1,0 +1,180 @@
+// Nexus-Match: Real-Time Matchmaking & Session Engine
+// Protocol Buffers v3 definition for all three core services.
+//
+// Services:
+//   1. PlayerGatewayService  — Bi-directional stream for heartbeat & queue status broadcast
+//   2. MatchmakerService     — Internal queue management (exposed for admin/debug)
+//   3. SessionTrackerService — Unary endpoint for submitting final match results
+
+syntax = "proto3";
+
+package nexus;
+
+option go_package = "nexus-match/pkg/pb";
+
+// ─────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────
+
+// QueueStatus represents every discrete state a player can occupy
+// from the moment they join the queue until the match concludes.
+enum QueueStatus {
+  QUEUE_STATUS_UNSPECIFIED = 0;
+  QUEUE_STATUS_WAITING     = 1;  // Player is in the pool, waiting for opponents
+  QUEUE_STATUS_MATCHED     = 2;  // A match has been found, session is being created
+  QUEUE_STATUS_IN_GAME     = 3;  // Players are inside an active session
+  QUEUE_STATUS_COMPLETED   = 4;  // The session has ended normally
+  QUEUE_STATUS_CANCELLED   = 5;  // Player or server cancelled the search
+  QUEUE_STATUS_ERROR       = 6;  // An unrecoverable error occurred
+}
+
+// MatchResult enumerates the possible outcomes for a player in a finished session.
+enum MatchResult {
+  MATCH_RESULT_UNSPECIFIED = 0;
+  MATCH_RESULT_WIN         = 1;
+  MATCH_RESULT_LOSS        = 2;
+  MATCH_RESULT_DRAW        = 3;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Core Messages
+// ─────────────────────────────────────────────────────────────
+
+// PlayerInfo carries the immutable identity + mutable rating of a player.
+// MMR (Match-Making Rating) is an int32 to avoid floating-point comparison
+// overhead and keep allocations tight.
+message PlayerInfo {
+  string player_id   = 1;   // UUID v4, assigned client-side
+  string display_name = 2;  // Human-readable tag
+  int32  mmr         = 3;   // Matchmaking rating, range [0, 10000]
+}
+
+// ─────────────────────────────────────────────────────────────
+// PlayerGatewayService messages
+// ─────────────────────────────────────────────────────────────
+
+// GatewayRequest is the client→server half of the bi-directional stream.
+// The first message MUST carry join_queue; subsequent messages are heartbeats
+// or explicit cancellations.
+message GatewayRequest {
+  oneof action {
+    JoinQueueAction    join_queue    = 1;  // Initial: enqueue the player
+    HeartbeatAction    heartbeat     = 2;  // Periodic keep-alive
+    CancelQueueAction  cancel_queue  = 3;  // Player wants out
+  }
+}
+
+message JoinQueueAction {
+  PlayerInfo player = 1;
+}
+
+message HeartbeatAction {
+  int64 client_timestamp_ms = 1;  // Unix millis, lets server measure drift
+}
+
+message CancelQueueAction {
+  string player_id = 1;
+  string reason    = 2;
+}
+
+// GatewayResponse is the server→client half. The server pushes status
+// updates and, ultimately, the match assignment.
+message GatewayResponse {
+  QueueStatus       status           = 1;
+  string            message          = 2;  // Human-readable context
+  int32             queue_position   = 3;  // Approximate position (0 = unknown)
+  int64             server_timestamp_ms = 4;
+  MatchAssignment   match            = 5;  // Non-nil only when status == MATCHED
+}
+
+// MatchAssignment contains everything a client needs to transition into a game.
+message MatchAssignment {
+  string          session_id = 1;   // Globally unique session identifier
+  repeated string player_ids = 2;   // All player IDs in this match
+  int64           created_at_ms = 3; // Session creation timestamp
+}
+
+// ─────────────────────────────────────────────────────────────
+// MatchmakerService messages
+// ─────────────────────────────────────────────────────────────
+
+// QueueStatsRequest is intentionally empty; stats are global.
+message QueueStatsRequest {}
+
+message QueueStatsResponse {
+  int32 total_waiting  = 1;
+  int32 total_matched  = 2;
+  int32 active_sessions = 3;
+}
+
+// ForceMatchRequest lets an admin/test harness trigger an immediate match cycle.
+message ForceMatchRequest {}
+
+message ForceMatchResponse {
+  int32 matches_created = 1;
+}
+
+// ─────────────────────────────────────────────────────────────
+// SessionTrackerService messages
+// ─────────────────────────────────────────────────────────────
+
+// SubmitResultRequest is sent by a client (or game server) once the match ends.
+message SubmitResultRequest {
+  string      session_id = 1;
+  string      player_id  = 2;
+  MatchResult result     = 3;
+  int32       score      = 4;    // In-game score (arbitrary units)
+  int32       duration_s = 5;    // Match duration in seconds
+}
+
+message SubmitResultResponse {
+  bool   accepted   = 1;
+  string message    = 2;
+  int32  new_mmr    = 3;  // Updated MMR after the result is applied
+}
+
+// GetSessionRequest retrieves summary data for a completed session.
+message GetSessionRequest {
+  string session_id = 1;
+}
+
+message SessionSummary {
+  string                  session_id   = 1;
+  repeated PlayerResult   results      = 2;
+  int64                   started_at_ms = 3;
+  int64                   ended_at_ms   = 4;
+  bool                    finalized    = 5; // true once all players submitted
+}
+
+message PlayerResult {
+  string      player_id = 1;
+  MatchResult result    = 2;
+  int32       score     = 3;
+  int32       mmr_delta = 4;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Service Definitions
+// ─────────────────────────────────────────────────────────────
+
+// PlayerGatewayService is the single entry point for every game client.
+// The bi-directional stream keeps the connection alive, broadcasts queue
+// status, and delivers the final match assignment.
+service PlayerGatewayService {
+  // EnterMatchmaking opens a persistent bi-di stream.
+  // Client sends JoinQueue → Heartbeats; Server pushes status updates.
+  rpc EnterMatchmaking(stream GatewayRequest) returns (stream GatewayResponse);
+}
+
+// MatchmakerService exposes observability + admin controls.
+// In production this would sit behind an internal-only listener.
+service MatchmakerService {
+  rpc GetQueueStats(QueueStatsRequest) returns (QueueStatsResponse);
+  rpc ForceMatch(ForceMatchRequest) returns (ForceMatchResponse);
+}
+
+// SessionTrackerService records match outcomes via Unary RPCs.
+service SessionTrackerService {
+  rpc SubmitResult(SubmitResultRequest) returns (SubmitResultResponse);
+  rpc GetSession(GetSessionRequest) returns (SessionSummary);
+}
