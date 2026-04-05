@@ -19,13 +19,14 @@ option go_package = "nexus-match/pkg/pb";
 // QueueStatus represents every discrete state a player can occupy
 // from the moment they join the queue until the match concludes.
 enum QueueStatus {
-  QUEUE_STATUS_UNSPECIFIED = 0;
-  QUEUE_STATUS_WAITING     = 1;  // Player is in the pool, waiting for opponents
-  QUEUE_STATUS_MATCHED     = 2;  // A match has been found, session is being created
-  QUEUE_STATUS_IN_GAME     = 3;  // Players are inside an active session
-  QUEUE_STATUS_COMPLETED   = 4;  // The session has ended normally
-  QUEUE_STATUS_CANCELLED   = 5;  // Player or server cancelled the search
-  QUEUE_STATUS_ERROR       = 6;  // An unrecoverable error occurred
+  QUEUE_STATUS_UNSPECIFIED  = 0;
+  QUEUE_STATUS_WAITING      = 1;  // Player is in the pool, waiting for opponents
+  QUEUE_STATUS_MATCHED      = 2;  // A match has been found (legacy, kept for compat)
+  QUEUE_STATUS_IN_GAME      = 3;  // All players accepted; session is live
+  QUEUE_STATUS_COMPLETED    = 4;  // The session has ended normally
+  QUEUE_STATUS_CANCELLED    = 5;  // Player or server cancelled the search
+  QUEUE_STATUS_ERROR        = 6;  // An unrecoverable error occurred
+  QUEUE_STATUS_READY_CHECK  = 7;  // Match found; awaiting player confirmation (10s)
 }
 
 // MatchResult enumerates the possible outcomes for a player in a finished session.
@@ -54,13 +55,14 @@ message PlayerInfo {
 // ─────────────────────────────────────────────────────────────
 
 // GatewayRequest is the client→server half of the bi-directional stream.
-// The first message MUST carry join_queue; subsequent messages are heartbeats
-// or explicit cancellations.
+// The first message MUST carry join_queue; subsequent messages are heartbeats,
+// explicit cancellations, or ready-check acceptances.
 message GatewayRequest {
   oneof action {
     JoinQueueAction    join_queue    = 1;  // Initial: enqueue the player
     HeartbeatAction    heartbeat     = 2;  // Periodic keep-alive
     CancelQueueAction  cancel_queue  = 3;  // Player wants out
+    AcceptMatchAction  accept_match  = 4;  // Player confirms ready-check
   }
 }
 
@@ -77,6 +79,12 @@ message CancelQueueAction {
   string reason    = 2;
 }
 
+// AcceptMatchAction is sent by the client within the ready-check window
+// (10 seconds) to confirm they are ready to enter the session.
+message AcceptMatchAction {
+  string player_id = 1;
+}
+
 // GatewayResponse is the server→client half. The server pushes status
 // updates and, ultimately, the match assignment.
 message GatewayResponse {
@@ -84,7 +92,7 @@ message GatewayResponse {
   string            message          = 2;  // Human-readable context
   int32             queue_position   = 3;  // Approximate position (0 = unknown)
   int64             server_timestamp_ms = 4;
-  MatchAssignment   match            = 5;  // Non-nil only when status == MATCHED
+  MatchAssignment   match            = 5;  // Non-nil when status == READY_CHECK or IN_GAME
 }
 
 // MatchAssignment contains everything a client needs to transition into a game.

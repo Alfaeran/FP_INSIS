@@ -75,3 +75,12 @@ go run -race ./client
 - **gRPC** with protobuf v3
 - **In-memory state** with `sync.RWMutex`
 - **Structured logging** via `log/slog`
+
+## Architecture Limitations & Future Scalability
+
+While the current architecture leverages an in-memory `sync.RWMutex` which is extremely fast and suitable for single-node deployments, it has limitations when deployed as a Commercial App that requires horizontal scaling across multiple server pods.
+
+To migrate this architecture for distributed scalability, the following technologies should be introduced:
+
+- **Redis Sorted Sets (ZSET)**: To centralize the player pool across all pods. The MMR score would act as the ZSET `score`, enabling O(log(N)) nearest-neighbor searches directly within Redis. This eliminates the constraint of having a single process manage the entire memory pool.
+- **Redis Pub/Sub or Kafka**: Since clients might be spread across multiple *Gateway Pods* while the *Matchmaker Worker* runs on a dedicated, separate pod, a distributed event bus is required. When a match is found, the worker would publish a `Ready Check` or `Match Found` event. The gateway holding the specific client's stream would consume this event and push it down the TCP/gRPC connection, decoupling connection management from matchmaking logic.

@@ -11,6 +11,7 @@ package services
 import (
 	"context"
 	"log/slog"
+	"strings"
 
 	pb "nexus-match/pkg/pb"
 	"nexus-match/internal/state"
@@ -74,14 +75,14 @@ func (t *TrackerServer) SubmitResult(
 			"player_id", req.PlayerId,
 			"err", err,
 		)
-		// Map domain errors to gRPC codes.
+		// Map domain errors to gRPC codes using standard library.
 		errMsg := err.Error()
 		switch {
-		case contains(errMsg, "not found"):
+		case strings.Contains(errMsg, "not found"):
 			return nil, status.Errorf(codes.NotFound, "%v", err)
-		case contains(errMsg, "not part of session"):
+		case strings.Contains(errMsg, "not part of session"):
 			return nil, status.Errorf(codes.PermissionDenied, "%v", err)
-		case contains(errMsg, "already submitted"):
+		case strings.Contains(errMsg, "already submitted"):
 			return nil, status.Errorf(codes.AlreadyExists, "%v", err)
 		default:
 			return nil, status.Errorf(codes.Internal, "%v", err)
@@ -135,19 +136,4 @@ func (t *TrackerServer) GetSession(
 		EndedAtMs:   session.EndedAt.UnixMilli(),
 		Finalized:   session.Finalized,
 	}, nil
-}
-
-// contains is a minimal string search to avoid importing strings package
-// for a single use.
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

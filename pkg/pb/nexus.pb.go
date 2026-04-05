@@ -36,11 +36,12 @@ type QueueStatus int32
 const (
 	QueueStatus_QUEUE_STATUS_UNSPECIFIED QueueStatus = 0
 	QueueStatus_QUEUE_STATUS_WAITING     QueueStatus = 1 // Player is in the pool, waiting for opponents
-	QueueStatus_QUEUE_STATUS_MATCHED     QueueStatus = 2 // A match has been found, session is being created
-	QueueStatus_QUEUE_STATUS_IN_GAME     QueueStatus = 3 // Players are inside an active session
+	QueueStatus_QUEUE_STATUS_MATCHED     QueueStatus = 2 // A match has been found (legacy, kept for compat)
+	QueueStatus_QUEUE_STATUS_IN_GAME     QueueStatus = 3 // All players accepted; session is live
 	QueueStatus_QUEUE_STATUS_COMPLETED   QueueStatus = 4 // The session has ended normally
 	QueueStatus_QUEUE_STATUS_CANCELLED   QueueStatus = 5 // Player or server cancelled the search
 	QueueStatus_QUEUE_STATUS_ERROR       QueueStatus = 6 // An unrecoverable error occurred
+	QueueStatus_QUEUE_STATUS_READY_CHECK QueueStatus = 7 // Match found; awaiting player confirmation (10s)
 )
 
 // Enum value maps for QueueStatus.
@@ -53,6 +54,7 @@ var (
 		4: "QUEUE_STATUS_COMPLETED",
 		5: "QUEUE_STATUS_CANCELLED",
 		6: "QUEUE_STATUS_ERROR",
+		7: "QUEUE_STATUS_READY_CHECK",
 	}
 	QueueStatus_value = map[string]int32{
 		"QUEUE_STATUS_UNSPECIFIED": 0,
@@ -62,6 +64,7 @@ var (
 		"QUEUE_STATUS_COMPLETED":   4,
 		"QUEUE_STATUS_CANCELLED":   5,
 		"QUEUE_STATUS_ERROR":       6,
+		"QUEUE_STATUS_READY_CHECK": 7,
 	}
 )
 
@@ -209,8 +212,8 @@ func (x *PlayerInfo) GetMmr() int32 {
 }
 
 // GatewayRequest is the client→server half of the bi-directional stream.
-// The first message MUST carry join_queue; subsequent messages are heartbeats
-// or explicit cancellations.
+// The first message MUST carry join_queue; subsequent messages are heartbeats,
+// explicit cancellations, or ready-check acceptances.
 type GatewayRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Action:
@@ -218,6 +221,7 @@ type GatewayRequest struct {
 	//	*GatewayRequest_JoinQueue
 	//	*GatewayRequest_Heartbeat
 	//	*GatewayRequest_CancelQueue
+	//	*GatewayRequest_AcceptMatch
 	Action        isGatewayRequest_Action `protobuf_oneof:"action"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -287,6 +291,15 @@ func (x *GatewayRequest) GetCancelQueue() *CancelQueueAction {
 	return nil
 }
 
+func (x *GatewayRequest) GetAcceptMatch() *AcceptMatchAction {
+	if x != nil {
+		if x, ok := x.Action.(*GatewayRequest_AcceptMatch); ok {
+			return x.AcceptMatch
+		}
+	}
+	return nil
+}
+
 type isGatewayRequest_Action interface {
 	isGatewayRequest_Action()
 }
@@ -303,11 +316,17 @@ type GatewayRequest_CancelQueue struct {
 	CancelQueue *CancelQueueAction `protobuf:"bytes,3,opt,name=cancel_queue,json=cancelQueue,proto3,oneof"` // Player wants out
 }
 
+type GatewayRequest_AcceptMatch struct {
+	AcceptMatch *AcceptMatchAction `protobuf:"bytes,4,opt,name=accept_match,json=acceptMatch,proto3,oneof"` // Player confirms ready-check
+}
+
 func (*GatewayRequest_JoinQueue) isGatewayRequest_Action() {}
 
 func (*GatewayRequest_Heartbeat) isGatewayRequest_Action() {}
 
 func (*GatewayRequest_CancelQueue) isGatewayRequest_Action() {}
+
+func (*GatewayRequest_AcceptMatch) isGatewayRequest_Action() {}
 
 type JoinQueueAction struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -449,6 +468,52 @@ func (x *CancelQueueAction) GetReason() string {
 	return ""
 }
 
+// AcceptMatchAction is sent by the client within the ready-check window
+// (10 seconds) to confirm they are ready to enter the session.
+type AcceptMatchAction struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PlayerId      string                 `protobuf:"bytes,1,opt,name=player_id,json=playerId,proto3" json:"player_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AcceptMatchAction) Reset() {
+	*x = AcceptMatchAction{}
+	mi := &file_nexus_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AcceptMatchAction) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AcceptMatchAction) ProtoMessage() {}
+
+func (x *AcceptMatchAction) ProtoReflect() protoreflect.Message {
+	mi := &file_nexus_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AcceptMatchAction.ProtoReflect.Descriptor instead.
+func (*AcceptMatchAction) Descriptor() ([]byte, []int) {
+	return file_nexus_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *AcceptMatchAction) GetPlayerId() string {
+	if x != nil {
+		return x.PlayerId
+	}
+	return ""
+}
+
 // GatewayResponse is the server→client half. The server pushes status
 // updates and, ultimately, the match assignment.
 type GatewayResponse struct {
@@ -457,14 +522,14 @@ type GatewayResponse struct {
 	Message           string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`                                   // Human-readable context
 	QueuePosition     int32                  `protobuf:"varint,3,opt,name=queue_position,json=queuePosition,proto3" json:"queue_position,omitempty"` // Approximate position (0 = unknown)
 	ServerTimestampMs int64                  `protobuf:"varint,4,opt,name=server_timestamp_ms,json=serverTimestampMs,proto3" json:"server_timestamp_ms,omitempty"`
-	Match             *MatchAssignment       `protobuf:"bytes,5,opt,name=match,proto3" json:"match,omitempty"` // Non-nil only when status == MATCHED
+	Match             *MatchAssignment       `protobuf:"bytes,5,opt,name=match,proto3" json:"match,omitempty"` // Non-nil when status == READY_CHECK or IN_GAME
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
 
 func (x *GatewayResponse) Reset() {
 	*x = GatewayResponse{}
-	mi := &file_nexus_proto_msgTypes[5]
+	mi := &file_nexus_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -476,7 +541,7 @@ func (x *GatewayResponse) String() string {
 func (*GatewayResponse) ProtoMessage() {}
 
 func (x *GatewayResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_nexus_proto_msgTypes[5]
+	mi := &file_nexus_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -489,7 +554,7 @@ func (x *GatewayResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GatewayResponse.ProtoReflect.Descriptor instead.
 func (*GatewayResponse) Descriptor() ([]byte, []int) {
-	return file_nexus_proto_rawDescGZIP(), []int{5}
+	return file_nexus_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *GatewayResponse) GetStatus() QueueStatus {
@@ -539,7 +604,7 @@ type MatchAssignment struct {
 
 func (x *MatchAssignment) Reset() {
 	*x = MatchAssignment{}
-	mi := &file_nexus_proto_msgTypes[6]
+	mi := &file_nexus_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -551,7 +616,7 @@ func (x *MatchAssignment) String() string {
 func (*MatchAssignment) ProtoMessage() {}
 
 func (x *MatchAssignment) ProtoReflect() protoreflect.Message {
-	mi := &file_nexus_proto_msgTypes[6]
+	mi := &file_nexus_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -564,7 +629,7 @@ func (x *MatchAssignment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MatchAssignment.ProtoReflect.Descriptor instead.
 func (*MatchAssignment) Descriptor() ([]byte, []int) {
-	return file_nexus_proto_rawDescGZIP(), []int{6}
+	return file_nexus_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *MatchAssignment) GetSessionId() string {
@@ -597,7 +662,7 @@ type QueueStatsRequest struct {
 
 func (x *QueueStatsRequest) Reset() {
 	*x = QueueStatsRequest{}
-	mi := &file_nexus_proto_msgTypes[7]
+	mi := &file_nexus_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -609,7 +674,7 @@ func (x *QueueStatsRequest) String() string {
 func (*QueueStatsRequest) ProtoMessage() {}
 
 func (x *QueueStatsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_nexus_proto_msgTypes[7]
+	mi := &file_nexus_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -622,7 +687,7 @@ func (x *QueueStatsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueueStatsRequest.ProtoReflect.Descriptor instead.
 func (*QueueStatsRequest) Descriptor() ([]byte, []int) {
-	return file_nexus_proto_rawDescGZIP(), []int{7}
+	return file_nexus_proto_rawDescGZIP(), []int{8}
 }
 
 type QueueStatsResponse struct {
@@ -636,7 +701,7 @@ type QueueStatsResponse struct {
 
 func (x *QueueStatsResponse) Reset() {
 	*x = QueueStatsResponse{}
-	mi := &file_nexus_proto_msgTypes[8]
+	mi := &file_nexus_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -648,7 +713,7 @@ func (x *QueueStatsResponse) String() string {
 func (*QueueStatsResponse) ProtoMessage() {}
 
 func (x *QueueStatsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_nexus_proto_msgTypes[8]
+	mi := &file_nexus_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -661,7 +726,7 @@ func (x *QueueStatsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueueStatsResponse.ProtoReflect.Descriptor instead.
 func (*QueueStatsResponse) Descriptor() ([]byte, []int) {
-	return file_nexus_proto_rawDescGZIP(), []int{8}
+	return file_nexus_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *QueueStatsResponse) GetTotalWaiting() int32 {
@@ -694,7 +759,7 @@ type ForceMatchRequest struct {
 
 func (x *ForceMatchRequest) Reset() {
 	*x = ForceMatchRequest{}
-	mi := &file_nexus_proto_msgTypes[9]
+	mi := &file_nexus_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -706,7 +771,7 @@ func (x *ForceMatchRequest) String() string {
 func (*ForceMatchRequest) ProtoMessage() {}
 
 func (x *ForceMatchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_nexus_proto_msgTypes[9]
+	mi := &file_nexus_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -719,7 +784,7 @@ func (x *ForceMatchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForceMatchRequest.ProtoReflect.Descriptor instead.
 func (*ForceMatchRequest) Descriptor() ([]byte, []int) {
-	return file_nexus_proto_rawDescGZIP(), []int{9}
+	return file_nexus_proto_rawDescGZIP(), []int{10}
 }
 
 type ForceMatchResponse struct {
@@ -731,7 +796,7 @@ type ForceMatchResponse struct {
 
 func (x *ForceMatchResponse) Reset() {
 	*x = ForceMatchResponse{}
-	mi := &file_nexus_proto_msgTypes[10]
+	mi := &file_nexus_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -743,7 +808,7 @@ func (x *ForceMatchResponse) String() string {
 func (*ForceMatchResponse) ProtoMessage() {}
 
 func (x *ForceMatchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_nexus_proto_msgTypes[10]
+	mi := &file_nexus_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -756,7 +821,7 @@ func (x *ForceMatchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForceMatchResponse.ProtoReflect.Descriptor instead.
 func (*ForceMatchResponse) Descriptor() ([]byte, []int) {
-	return file_nexus_proto_rawDescGZIP(), []int{10}
+	return file_nexus_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ForceMatchResponse) GetMatchesCreated() int32 {
@@ -780,7 +845,7 @@ type SubmitResultRequest struct {
 
 func (x *SubmitResultRequest) Reset() {
 	*x = SubmitResultRequest{}
-	mi := &file_nexus_proto_msgTypes[11]
+	mi := &file_nexus_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -792,7 +857,7 @@ func (x *SubmitResultRequest) String() string {
 func (*SubmitResultRequest) ProtoMessage() {}
 
 func (x *SubmitResultRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_nexus_proto_msgTypes[11]
+	mi := &file_nexus_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -805,7 +870,7 @@ func (x *SubmitResultRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitResultRequest.ProtoReflect.Descriptor instead.
 func (*SubmitResultRequest) Descriptor() ([]byte, []int) {
-	return file_nexus_proto_rawDescGZIP(), []int{11}
+	return file_nexus_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *SubmitResultRequest) GetSessionId() string {
@@ -854,7 +919,7 @@ type SubmitResultResponse struct {
 
 func (x *SubmitResultResponse) Reset() {
 	*x = SubmitResultResponse{}
-	mi := &file_nexus_proto_msgTypes[12]
+	mi := &file_nexus_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -866,7 +931,7 @@ func (x *SubmitResultResponse) String() string {
 func (*SubmitResultResponse) ProtoMessage() {}
 
 func (x *SubmitResultResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_nexus_proto_msgTypes[12]
+	mi := &file_nexus_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -879,7 +944,7 @@ func (x *SubmitResultResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitResultResponse.ProtoReflect.Descriptor instead.
 func (*SubmitResultResponse) Descriptor() ([]byte, []int) {
-	return file_nexus_proto_rawDescGZIP(), []int{12}
+	return file_nexus_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *SubmitResultResponse) GetAccepted() bool {
@@ -913,7 +978,7 @@ type GetSessionRequest struct {
 
 func (x *GetSessionRequest) Reset() {
 	*x = GetSessionRequest{}
-	mi := &file_nexus_proto_msgTypes[13]
+	mi := &file_nexus_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -925,7 +990,7 @@ func (x *GetSessionRequest) String() string {
 func (*GetSessionRequest) ProtoMessage() {}
 
 func (x *GetSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_nexus_proto_msgTypes[13]
+	mi := &file_nexus_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -938,7 +1003,7 @@ func (x *GetSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSessionRequest.ProtoReflect.Descriptor instead.
 func (*GetSessionRequest) Descriptor() ([]byte, []int) {
-	return file_nexus_proto_rawDescGZIP(), []int{13}
+	return file_nexus_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *GetSessionRequest) GetSessionId() string {
@@ -961,7 +1026,7 @@ type SessionSummary struct {
 
 func (x *SessionSummary) Reset() {
 	*x = SessionSummary{}
-	mi := &file_nexus_proto_msgTypes[14]
+	mi := &file_nexus_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -973,7 +1038,7 @@ func (x *SessionSummary) String() string {
 func (*SessionSummary) ProtoMessage() {}
 
 func (x *SessionSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_nexus_proto_msgTypes[14]
+	mi := &file_nexus_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -986,7 +1051,7 @@ func (x *SessionSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SessionSummary.ProtoReflect.Descriptor instead.
 func (*SessionSummary) Descriptor() ([]byte, []int) {
-	return file_nexus_proto_rawDescGZIP(), []int{14}
+	return file_nexus_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *SessionSummary) GetSessionId() string {
@@ -1036,7 +1101,7 @@ type PlayerResult struct {
 
 func (x *PlayerResult) Reset() {
 	*x = PlayerResult{}
-	mi := &file_nexus_proto_msgTypes[15]
+	mi := &file_nexus_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1048,7 +1113,7 @@ func (x *PlayerResult) String() string {
 func (*PlayerResult) ProtoMessage() {}
 
 func (x *PlayerResult) ProtoReflect() protoreflect.Message {
-	mi := &file_nexus_proto_msgTypes[15]
+	mi := &file_nexus_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1061,7 +1126,7 @@ func (x *PlayerResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlayerResult.ProtoReflect.Descriptor instead.
 func (*PlayerResult) Descriptor() ([]byte, []int) {
-	return file_nexus_proto_rawDescGZIP(), []int{15}
+	return file_nexus_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *PlayerResult) GetPlayerId() string {
@@ -1101,12 +1166,13 @@ const file_nexus_proto_rawDesc = "" +
 	"PlayerInfo\x12\x1b\n" +
 	"\tplayer_id\x18\x01 \x01(\tR\bplayerId\x12!\n" +
 	"\fdisplay_name\x18\x02 \x01(\tR\vdisplayName\x12\x10\n" +
-	"\x03mmr\x18\x03 \x01(\x05R\x03mmr\"\xca\x01\n" +
+	"\x03mmr\x18\x03 \x01(\x05R\x03mmr\"\x89\x02\n" +
 	"\x0eGatewayRequest\x127\n" +
 	"\n" +
 	"join_queue\x18\x01 \x01(\v2\x16.nexus.JoinQueueActionH\x00R\tjoinQueue\x126\n" +
 	"\theartbeat\x18\x02 \x01(\v2\x16.nexus.HeartbeatActionH\x00R\theartbeat\x12=\n" +
-	"\fcancel_queue\x18\x03 \x01(\v2\x18.nexus.CancelQueueActionH\x00R\vcancelQueueB\b\n" +
+	"\fcancel_queue\x18\x03 \x01(\v2\x18.nexus.CancelQueueActionH\x00R\vcancelQueue\x12=\n" +
+	"\faccept_match\x18\x04 \x01(\v2\x18.nexus.AcceptMatchActionH\x00R\vacceptMatchB\b\n" +
 	"\x06action\"<\n" +
 	"\x0fJoinQueueAction\x12)\n" +
 	"\x06player\x18\x01 \x01(\v2\x11.nexus.PlayerInfoR\x06player\"A\n" +
@@ -1114,7 +1180,9 @@ const file_nexus_proto_rawDesc = "" +
 	"\x13client_timestamp_ms\x18\x01 \x01(\x03R\x11clientTimestampMs\"H\n" +
 	"\x11CancelQueueAction\x12\x1b\n" +
 	"\tplayer_id\x18\x01 \x01(\tR\bplayerId\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reason\"\xdc\x01\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\"0\n" +
+	"\x11AcceptMatchAction\x12\x1b\n" +
+	"\tplayer_id\x18\x01 \x01(\tR\bplayerId\"\xdc\x01\n" +
 	"\x0fGatewayResponse\x12*\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x12.nexus.QueueStatusR\x06status\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12%\n" +
@@ -1161,7 +1229,7 @@ const file_nexus_proto_rawDesc = "" +
 	"\tplayer_id\x18\x01 \x01(\tR\bplayerId\x12*\n" +
 	"\x06result\x18\x02 \x01(\x0e2\x12.nexus.MatchResultR\x06result\x12\x14\n" +
 	"\x05score\x18\x03 \x01(\x05R\x05score\x12\x1b\n" +
-	"\tmmr_delta\x18\x04 \x01(\x05R\bmmrDelta*\xc9\x01\n" +
+	"\tmmr_delta\x18\x04 \x01(\x05R\bmmrDelta*\xe7\x01\n" +
 	"\vQueueStatus\x12\x1c\n" +
 	"\x18QUEUE_STATUS_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14QUEUE_STATUS_WAITING\x10\x01\x12\x18\n" +
@@ -1169,7 +1237,8 @@ const file_nexus_proto_rawDesc = "" +
 	"\x14QUEUE_STATUS_IN_GAME\x10\x03\x12\x1a\n" +
 	"\x16QUEUE_STATUS_COMPLETED\x10\x04\x12\x1a\n" +
 	"\x16QUEUE_STATUS_CANCELLED\x10\x05\x12\x16\n" +
-	"\x12QUEUE_STATUS_ERROR\x10\x06*o\n" +
+	"\x12QUEUE_STATUS_ERROR\x10\x06\x12\x1c\n" +
+	"\x18QUEUE_STATUS_READY_CHECK\x10\a*o\n" +
 	"\vMatchResult\x12\x1c\n" +
 	"\x18MATCH_RESULT_UNSPECIFIED\x10\x00\x12\x14\n" +
 	"\x10MATCH_RESULT_WIN\x10\x01\x12\x15\n" +
@@ -1199,7 +1268,7 @@ func file_nexus_proto_rawDescGZIP() []byte {
 }
 
 var file_nexus_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_nexus_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_nexus_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_nexus_proto_goTypes = []any{
 	(QueueStatus)(0),             // 0: nexus.QueueStatus
 	(MatchResult)(0),             // 1: nexus.MatchResult
@@ -1208,43 +1277,45 @@ var file_nexus_proto_goTypes = []any{
 	(*JoinQueueAction)(nil),      // 4: nexus.JoinQueueAction
 	(*HeartbeatAction)(nil),      // 5: nexus.HeartbeatAction
 	(*CancelQueueAction)(nil),    // 6: nexus.CancelQueueAction
-	(*GatewayResponse)(nil),      // 7: nexus.GatewayResponse
-	(*MatchAssignment)(nil),      // 8: nexus.MatchAssignment
-	(*QueueStatsRequest)(nil),    // 9: nexus.QueueStatsRequest
-	(*QueueStatsResponse)(nil),   // 10: nexus.QueueStatsResponse
-	(*ForceMatchRequest)(nil),    // 11: nexus.ForceMatchRequest
-	(*ForceMatchResponse)(nil),   // 12: nexus.ForceMatchResponse
-	(*SubmitResultRequest)(nil),  // 13: nexus.SubmitResultRequest
-	(*SubmitResultResponse)(nil), // 14: nexus.SubmitResultResponse
-	(*GetSessionRequest)(nil),    // 15: nexus.GetSessionRequest
-	(*SessionSummary)(nil),       // 16: nexus.SessionSummary
-	(*PlayerResult)(nil),         // 17: nexus.PlayerResult
+	(*AcceptMatchAction)(nil),    // 7: nexus.AcceptMatchAction
+	(*GatewayResponse)(nil),      // 8: nexus.GatewayResponse
+	(*MatchAssignment)(nil),      // 9: nexus.MatchAssignment
+	(*QueueStatsRequest)(nil),    // 10: nexus.QueueStatsRequest
+	(*QueueStatsResponse)(nil),   // 11: nexus.QueueStatsResponse
+	(*ForceMatchRequest)(nil),    // 12: nexus.ForceMatchRequest
+	(*ForceMatchResponse)(nil),   // 13: nexus.ForceMatchResponse
+	(*SubmitResultRequest)(nil),  // 14: nexus.SubmitResultRequest
+	(*SubmitResultResponse)(nil), // 15: nexus.SubmitResultResponse
+	(*GetSessionRequest)(nil),    // 16: nexus.GetSessionRequest
+	(*SessionSummary)(nil),       // 17: nexus.SessionSummary
+	(*PlayerResult)(nil),         // 18: nexus.PlayerResult
 }
 var file_nexus_proto_depIdxs = []int32{
 	4,  // 0: nexus.GatewayRequest.join_queue:type_name -> nexus.JoinQueueAction
 	5,  // 1: nexus.GatewayRequest.heartbeat:type_name -> nexus.HeartbeatAction
 	6,  // 2: nexus.GatewayRequest.cancel_queue:type_name -> nexus.CancelQueueAction
-	2,  // 3: nexus.JoinQueueAction.player:type_name -> nexus.PlayerInfo
-	0,  // 4: nexus.GatewayResponse.status:type_name -> nexus.QueueStatus
-	8,  // 5: nexus.GatewayResponse.match:type_name -> nexus.MatchAssignment
-	1,  // 6: nexus.SubmitResultRequest.result:type_name -> nexus.MatchResult
-	17, // 7: nexus.SessionSummary.results:type_name -> nexus.PlayerResult
-	1,  // 8: nexus.PlayerResult.result:type_name -> nexus.MatchResult
-	3,  // 9: nexus.PlayerGatewayService.EnterMatchmaking:input_type -> nexus.GatewayRequest
-	9,  // 10: nexus.MatchmakerService.GetQueueStats:input_type -> nexus.QueueStatsRequest
-	11, // 11: nexus.MatchmakerService.ForceMatch:input_type -> nexus.ForceMatchRequest
-	13, // 12: nexus.SessionTrackerService.SubmitResult:input_type -> nexus.SubmitResultRequest
-	15, // 13: nexus.SessionTrackerService.GetSession:input_type -> nexus.GetSessionRequest
-	7,  // 14: nexus.PlayerGatewayService.EnterMatchmaking:output_type -> nexus.GatewayResponse
-	10, // 15: nexus.MatchmakerService.GetQueueStats:output_type -> nexus.QueueStatsResponse
-	12, // 16: nexus.MatchmakerService.ForceMatch:output_type -> nexus.ForceMatchResponse
-	14, // 17: nexus.SessionTrackerService.SubmitResult:output_type -> nexus.SubmitResultResponse
-	16, // 18: nexus.SessionTrackerService.GetSession:output_type -> nexus.SessionSummary
-	14, // [14:19] is the sub-list for method output_type
-	9,  // [9:14] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	7,  // 3: nexus.GatewayRequest.accept_match:type_name -> nexus.AcceptMatchAction
+	2,  // 4: nexus.JoinQueueAction.player:type_name -> nexus.PlayerInfo
+	0,  // 5: nexus.GatewayResponse.status:type_name -> nexus.QueueStatus
+	9,  // 6: nexus.GatewayResponse.match:type_name -> nexus.MatchAssignment
+	1,  // 7: nexus.SubmitResultRequest.result:type_name -> nexus.MatchResult
+	18, // 8: nexus.SessionSummary.results:type_name -> nexus.PlayerResult
+	1,  // 9: nexus.PlayerResult.result:type_name -> nexus.MatchResult
+	3,  // 10: nexus.PlayerGatewayService.EnterMatchmaking:input_type -> nexus.GatewayRequest
+	10, // 11: nexus.MatchmakerService.GetQueueStats:input_type -> nexus.QueueStatsRequest
+	12, // 12: nexus.MatchmakerService.ForceMatch:input_type -> nexus.ForceMatchRequest
+	14, // 13: nexus.SessionTrackerService.SubmitResult:input_type -> nexus.SubmitResultRequest
+	16, // 14: nexus.SessionTrackerService.GetSession:input_type -> nexus.GetSessionRequest
+	8,  // 15: nexus.PlayerGatewayService.EnterMatchmaking:output_type -> nexus.GatewayResponse
+	11, // 16: nexus.MatchmakerService.GetQueueStats:output_type -> nexus.QueueStatsResponse
+	13, // 17: nexus.MatchmakerService.ForceMatch:output_type -> nexus.ForceMatchResponse
+	15, // 18: nexus.SessionTrackerService.SubmitResult:output_type -> nexus.SubmitResultResponse
+	17, // 19: nexus.SessionTrackerService.GetSession:output_type -> nexus.SessionSummary
+	15, // [15:20] is the sub-list for method output_type
+	10, // [10:15] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_nexus_proto_init() }
@@ -1256,6 +1327,7 @@ func file_nexus_proto_init() {
 		(*GatewayRequest_JoinQueue)(nil),
 		(*GatewayRequest_Heartbeat)(nil),
 		(*GatewayRequest_CancelQueue)(nil),
+		(*GatewayRequest_AcceptMatch)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1263,7 +1335,7 @@ func file_nexus_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_nexus_proto_rawDesc), len(file_nexus_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   16,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   3,
 		},

@@ -1,23 +1,24 @@
 // Package services — matchmaker.go implements the MatchmakerService.
 //
-// Architecture:
-//   - A background worker goroutine runs on a configurable tick interval.
-//   - On each tick, it calls pool.ExtractMatch() which atomically pulls
-//     PlayersPerMatch players from the pool.
-//   - For each successful extraction, it generates a UUID session, creates
-//     a Session in the SessionStore, and then writes a MatchEvent to each
-//     player's MatchCh channel.
-//   - The worker is started via StartWorker() and stopped via StopWorker().
+// Architecture (v2 — with Ready Check coordination):
+//   - Background worker scans pool on a tick, calls pool.ExtractMatch().
+//   - On extraction, instead of immediately creating a session, the worker
+//     sends a MatchEvent with AcceptCh/ResultCh to each player's MatchCh,
+//     then launches a readyCheckCoordinator goroutine.
+//   - The coordinator waits up to 10 seconds for all 10 players to signal
+//     acceptance on their AcceptCh. On success, it creates the session and
+//     writes true to ResultCh. On failure (timeout / missing acceptance),
+//     it writes false and re-enqueues the 9 players who DID accept.
 //
 // Channel closing protocol:
-//   - The stopCh channel is closed by StopWorker() to signal the worker
-//     goroutine to exit. We never write to stopCh; we only close it.
-//   - Each QueuedPlayer.MatchCh is a buffered(1) channel. The worker writes
-//     exactly once. If the player's gateway handler is slow, the write won't
-//     block because the buffer absorbs it.
+//   - stopCh: closed by StopWorker() → worker exits.
+//   - MatchCh: buffered(1), written once by worker, read once by gateway.
+//   - AcceptCh: buffered(1), written by gateway, read by coordinator.
+//   - ResultCh: written once by coordinator (true/false), then closed.
 //
-// Deadlock-free: the worker holds no locks itself. All locking is internal
-// to pool.ExtractMatch() calls, which is a single-mutex design.
+// Deadlock-free: the coordinator never holds pool.mu while waiting on
+// channels. All pool operations (ReEnqueue) acquire + release the lock
+// within one call frame.
 package services
 
 import (
@@ -30,6 +31,13 @@ import (
 	"nexus-match/internal/state"
 
 	"github.com/google/uuid"
+)
+
+const (
+	// readyCheckCoordTimeout is the total time the coordinator waits for
+	// all players to accept. Must match or slightly exceed the gateway's
+	// readyCheckTimeout to account for network latency.
+	readyCheckCoordTimeout = 12 * time.Second
 )
 
 // ─────────────────────────────────────────────────────────────
@@ -51,7 +59,8 @@ type MatchmakerServer struct {
 	// Never written to — only closed.
 	stopCh chan struct{}
 
-	// wg tracks the worker goroutine for clean shutdown.
+	// wg tracks the worker goroutine AND all coordinator goroutines
+	// for clean shutdown.
 	wg sync.WaitGroup
 
 	// matchesCreated is a simple monotonic counter for observability.
@@ -70,20 +79,15 @@ func NewMatchmakerServer(pool *state.Pool, sessions *state.SessionStore, tickInt
 }
 
 // StartWorker launches the background match scanning goroutine.
-// Call this once after creating the server.
 func (m *MatchmakerServer) StartWorker() {
 	m.wg.Add(1)
 	go m.worker()
 	slog.Info("matchmaker: worker started", "tick_interval", m.tickInterval)
 }
 
-// StopWorker signals the worker to exit and waits for it to finish.
-// Safe to call multiple times (close on already-closed channel is caught).
+// StopWorker signals the worker to exit and waits for it + all coordinators.
 func (m *MatchmakerServer) StopWorker() {
-	defer func() {
-		// Guard against double-close panic.
-		recover()
-	}()
+	defer func() { recover() }() // guard double-close
 	close(m.stopCh)
 	m.wg.Wait()
 	slog.Info("matchmaker: worker stopped")
@@ -115,38 +119,40 @@ func (m *MatchmakerServer) tick() {
 	for {
 		players, ok := m.pool.ExtractMatch()
 		if !ok {
-			return // not enough players for another match
+			return
 		}
 
 		sessionID := uuid.New().String()
 		now := time.Now()
 
-		// Gather player IDs.
 		playerIDs := make([]string, len(players))
 		for i, p := range players {
 			playerIDs[i] = p.PlayerID
 		}
 
-		// Register the session.
-		m.sessions.CreateSession(sessionID, playerIDs)
+		// Create per-player AcceptCh channels and a shared ResultCh.
+		resultCh := make(chan bool, 1)
+		acceptChannels := make([]chan struct{}, len(players))
 
-		// Build the event.
-		evt := state.MatchEvent{
-			SessionID: sessionID,
-			PlayerIDs: playerIDs,
-			CreatedAt: now,
+		for i := range players {
+			acceptChannels[i] = make(chan struct{}, 1)
 		}
 
-		// Notify each player through their buffered channel.
-		// Because MatchCh has capacity 1 and is written exactly once,
-		// this send will never block.
-		for _, p := range players {
+		// Build MatchEvents with shared ResultCh but individual AcceptCh.
+		for i, p := range players {
+			evt := state.MatchEvent{
+				SessionID: sessionID,
+				PlayerIDs: playerIDs,
+				CreatedAt: now,
+				AcceptCh:  acceptChannels[i],
+				ResultCh:  resultCh,
+			}
+
 			select {
 			case p.MatchCh <- evt:
-				// Delivered successfully.
+				// Delivered.
 			default:
-				// Channel is full or closed — player disconnected between
-				// extraction and notification. Log and move on.
+				// Player disconnected between extraction and notification.
 				slog.Warn("matchmaker: failed to notify player",
 					"player_id", p.PlayerID,
 					"session_id", sessionID,
@@ -154,16 +160,120 @@ func (m *MatchmakerServer) tick() {
 			}
 		}
 
+		// Launch the ready-check coordinator in a separate goroutine.
+		// It is tracked by m.wg so StopWorker waits for it.
+		m.wg.Add(1)
+		go m.readyCheckCoordinator(sessionID, players, acceptChannels, resultCh)
+
 		m.counterMu.Lock()
 		m.matchesCreated++
 		total := m.matchesCreated
 		m.counterMu.Unlock()
 
-		slog.Info("matchmaker: match created",
+		slog.Info("matchmaker: ready-check initiated",
 			"session_id", sessionID,
 			"players", len(playerIDs),
-			"total_matches", total,
+			"total_matches_attempted", total,
 		)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+// Ready Check Coordinator
+// ─────────────────────────────────────────────────────────────
+
+// readyCheckCoordinator waits for all players to accept within the timeout.
+// On success, it creates the session. On failure, it re-enqueues players
+// who accepted and notifies everyone via resultCh.
+//
+// This goroutine holds NO locks while waiting. All pool/session operations
+// are short, single-frame lock acquisitions.
+func (m *MatchmakerServer) readyCheckCoordinator(
+	sessionID string,
+	players []*state.QueuedPlayer,
+	acceptChannels []chan struct{},
+	resultCh chan bool,
+) {
+	defer m.wg.Done()
+
+	ctx, cancel := context.WithTimeout(context.Background(), readyCheckCoordTimeout)
+	defer cancel()
+
+	accepted := make([]bool, len(players))
+	allAccepted := true
+
+	// Wait for each player sequentially within the shared timeout.
+	// Because all players have the same deadline, the total wait is bounded
+	// by readyCheckCoordTimeout regardless of order.
+	for i, ch := range acceptChannels {
+		select {
+		case <-ch:
+			accepted[i] = true
+			slog.Info("matchmaker: player accepted",
+				"player_id", players[i].PlayerID,
+				"session_id", sessionID,
+			)
+		case <-ctx.Done():
+			// Timeout reached — remaining players have not accepted.
+			allAccepted = false
+			slog.Warn("matchmaker: ready-check timeout",
+				"player_id", players[i].PlayerID,
+				"session_id", sessionID,
+			)
+			// Mark remaining as not accepted and break out.
+			for j := i; j < len(players); j++ {
+				accepted[j] = false
+			}
+			goto verdict
+		}
+	}
+
+verdict:
+	if allAccepted {
+		// All 10 players accepted → create the session.
+		m.sessions.CreateSession(sessionID, func() []string {
+			ids := make([]string, len(players))
+			for i, p := range players {
+				ids[i] = p.PlayerID
+			}
+			return ids
+		}())
+
+		slog.Info("matchmaker: session confirmed",
+			"session_id", sessionID,
+			"players", len(players),
+		)
+
+		// Notify all gateways: room confirmed.
+		resultCh <- true
+		close(resultCh)
+		return
+	}
+
+	// At least one player did not accept → cancel the room.
+	slog.Warn("matchmaker: room cancelled (ready-check failed)",
+		"session_id", sessionID,
+	)
+
+	// Notify all gateways: room cancelled.
+	resultCh <- false
+	close(resultCh)
+
+	// Re-enqueue players who DID accept. They should not lose their
+	// queue position or their open channels.
+	for i, p := range players {
+		if accepted[i] {
+			if err := m.pool.ReEnqueue(p); err != nil {
+				slog.Warn("matchmaker: re-enqueue failed",
+					"player_id", p.PlayerID,
+					"err", err,
+				)
+			} else {
+				slog.Info("matchmaker: player re-enqueued after failed ready-check",
+					"player_id", p.PlayerID,
+				)
+			}
+		}
 	}
 }
 

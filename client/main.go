@@ -1,17 +1,12 @@
-// client/main.go — Nexus-Match multi-client stress test simulator.
+// client/main.go — Nexus-Match multi-client stress test simulator (v2).
 //
 // Launches 50 concurrent goroutines, each simulating a player that:
 //   1. Connects to the Gateway via bi-directional stream.
 //   2. Sends JoinQueueAction with a randomized MMR.
 //   3. Sends periodic heartbeats while waiting.
-//   4. Receives the MATCHED assignment.
-//   5. Submits a result to the SessionTracker via Unary RPC.
-//
-// The simulator exercises:
-//   - Concurrent stream establishment (50 simultaneous dials)
-//   - In-memory pool contention (50 enqueue + heartbeat + dequeue operations)
-//   - Match notification delivery (MatchCh channel writes under load)
-//   - Unary result submission (50 sequential submits per match)
+//   4. Receives READY_CHECK → sends AcceptMatchAction.
+//   5. Waits for IN_GAME confirmation.
+//   6. Submits a result to the SessionTracker via Unary RPC.
 //
 // Run with `go run -race ./client` to detect data races.
 package main
@@ -38,14 +33,14 @@ const (
 	serverAddr    = "localhost:50051"
 	numPlayers    = 50
 	heartbeatRate = 1 * time.Second
-	matchTimeout  = 30 * time.Second
+	matchTimeout  = 60 * time.Second // increased to accommodate ready-check
 )
 
 // stats tracks aggregate outcomes across all goroutines.
 var (
-	matched  atomic.Int64
-	failed   atomic.Int64
-	results  atomic.Int64
+	matched atomic.Int64
+	failed  atomic.Int64
+	results atomic.Int64
 )
 
 func main() {
@@ -70,7 +65,7 @@ func main() {
 			simulatePlayer(idx)
 		}(i)
 
-		// Stagger connections slightly to avoid thundering herd on the listener.
+		// Stagger connections slightly to avoid thundering herd.
 		time.Sleep(20 * time.Millisecond)
 	}
 
@@ -139,8 +134,6 @@ func simulatePlayer(idx int) {
 	logger.Info("joined queue")
 
 	// ── Heartbeat sender goroutine ──────────────────────────────────────
-	// This goroutine exits when ctx is cancelled (match found / timeout)
-	// or when the stream is closed.
 	go func() {
 		ticker := time.NewTicker(heartbeatRate)
 		defer ticker.Stop()
@@ -156,14 +149,13 @@ func simulatePlayer(idx int) {
 						},
 					},
 				}); err != nil {
-					// Stream probably closed; exit silently.
 					return
 				}
 			}
 		}
 	}()
 
-	// ── Read server responses until MATCHED or error ────────────────────
+	// ── Read server responses ───────────────────────────────────────────
 	var sessionID string
 	for {
 		resp, err := stream.Recv()
@@ -183,9 +175,28 @@ func simulatePlayer(idx int) {
 				"queue_position", resp.QueuePosition,
 			)
 
-		case pb.QueueStatus_QUEUE_STATUS_MATCHED:
+		case pb.QueueStatus_QUEUE_STATUS_READY_CHECK:
+			// Server is asking us to confirm. Send AcceptMatchAction immediately.
+			logger.Info("READY CHECK received, accepting...",
+				"session_id", resp.Match.SessionId,
+			)
+
+			if err := stream.Send(&pb.GatewayRequest{
+				Action: &pb.GatewayRequest_AcceptMatch{
+					AcceptMatch: &pb.AcceptMatchAction{
+						PlayerId: playerID,
+					},
+				},
+			}); err != nil {
+				logger.Error("failed to send accept", "err", err)
+				failed.Add(1)
+				return
+			}
+
+		case pb.QueueStatus_QUEUE_STATUS_IN_GAME:
+			// All players accepted. Session is live!
 			sessionID = resp.Match.SessionId
-			logger.Info("MATCHED!",
+			logger.Info("SESSION CONFIRMED!",
 				"session_id", sessionID,
 				"players", resp.Match.PlayerIds,
 			)

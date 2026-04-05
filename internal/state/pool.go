@@ -17,6 +17,17 @@
 //   - The match worker calls ExtractMatch which holds the lock for the duration
 //     of player selection + removal. This is O(bracket_size) and bounded by the
 //     bracket cap, so the critical section is short.
+//
+// Anti-starvation (v2):
+//   - ExtractMatch now uses a weighted score instead of raw MMR spread.
+//     Score = MMR_Spread - (AvgWaitSeconds * WaitWeight).
+//     Windows with long-waiting players get a lower (better) score even if
+//     their MMR spread is slightly wider, preventing indefinite starvation.
+//
+// Slice memory management (v2):
+//   - removeFromSlice now shrinks the backing array when len < cap/4,
+//     preventing long-term memory leaks from bracket slices that grew large
+//     during peak load and then drained.
 package state
 
 import (
@@ -45,6 +56,13 @@ const (
 	// MaxBracketExpansion controls how many adjacent brackets the matcher
 	// may search when a single bracket is under-populated.
 	MaxBracketExpansion = 2
+
+	// WaitWeight controls how aggressively the matcher favours long-waiting
+	// players. Each second of average wait time in a candidate window reduces
+	// the effective score by this many MMR points. A value of 5 means that
+	// after 20 seconds, a window is treated as if its spread were 100 MMR
+	// tighter, making it likely to be chosen over a fresher, tighter cluster.
+	WaitWeight float64 = 5.0
 )
 
 // ─────────────────────────────────────────────────────────────
@@ -67,10 +85,25 @@ type QueuedPlayer struct {
 }
 
 // MatchEvent is the payload delivered through QueuedPlayer.MatchCh.
+//
+// Channel protocol for the Ready Check flow:
+//   - AcceptCh (buffered 1): The gateway handler writes once when the client
+//     sends AcceptMatchAction. The coordinator reads it within the timeout.
+//   - ResultCh (unbuffered): The coordinator closes this channel after writing
+//     one bool: true = room confirmed, false = room cancelled. All gateway
+//     handlers select on it to learn the outcome.
 type MatchEvent struct {
 	SessionID string
 	PlayerIDs []string
 	CreatedAt time.Time
+
+	// AcceptCh: gateway → coordinator. Buffered(1) so the gateway
+	// never blocks even if the coordinator hasn't started reading.
+	AcceptCh chan struct{}
+
+	// ResultCh: coordinator → gateways. The coordinator sends exactly one
+	// bool (true=confirmed, false=cancelled), then closes the channel.
+	ResultCh chan bool
 }
 
 // Pool is the thread-safe in-memory matchmaking queue.
@@ -145,6 +178,31 @@ func (p *Pool) Enqueue(id, name string, mmr int32) (*QueuedPlayer, error) {
 	return qp, nil
 }
 
+// ReEnqueue places a player back into the pool after a failed ready-check.
+// It directly inserts the existing QueuedPlayer struct so the gateway's
+// select loop can continue listening on the exact same MatchCh.
+func (p *Pool) ReEnqueue(qp *QueuedPlayer) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, exists := p.players[qp.PlayerID]; exists {
+		return fmt.Errorf("player %s already in queue", qp.PlayerID)
+	}
+
+	p.players[qp.PlayerID] = qp
+
+	bk := bracketKey(qp.MMR)
+	p.brackets[bk] = insertSorted(p.brackets[bk], qp)
+
+	slog.Info("player re-enqueued (ready-check fail)",
+		"player_id", qp.PlayerID,
+		"mmr", qp.MMR,
+		"pool_size", len(p.players),
+	)
+
+	return nil
+}
+
 // Dequeue removes a player from the pool (e.g. cancel or disconnect).
 // Returns true if the player was found and removed.
 func (p *Pool) Dequeue(id string) bool {
@@ -194,8 +252,14 @@ func (p *Pool) Size() int {
 }
 
 // ExtractMatch attempts to pull PlayersPerMatch players from the pool whose
-// MMR values are as close together as possible. It searches the bracket with
-// the most players first, then expands to neighbours.
+// MMR values are as close together as possible, with a bias toward players
+// who have been waiting longer (anti-starvation).
+//
+// Scoring formula per sliding window:
+//   Score = MMR_Spread - (Avg_Wait_Seconds * WaitWeight)
+// Lower score = better window. A 10-player window where everyone has waited
+// 30 seconds gets a -150 point bonus (at WaitWeight=5), so it beats a
+// zero-spread window of players who just joined.
 //
 // On success, the returned players are REMOVED from the pool and their
 // MatchCh channels are still open (the caller is responsible for writing the
@@ -206,6 +270,8 @@ func (p *Pool) Size() int {
 func (p *Pool) ExtractMatch() ([]*QueuedPlayer, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	now := time.Now()
 
 	// Find the bracket with the most players.
 	bestBK := -1
@@ -243,14 +309,28 @@ func (p *Pool) ExtractMatch() ([]*QueuedPlayer, bool) {
 		return candidates[i].MMR < candidates[j].MMR
 	})
 
-	// Sliding window: find the window of PlayersPerMatch with the smallest
-	// MMR spread (max - min). This runs in O(N) where N ≤ bracket_size * 5.
+	// Sliding window with anti-starvation scoring.
+	// For each window of PlayersPerMatch candidates, compute:
+	//   score = float64(mmr_spread) - (avg_wait_seconds * WaitWeight)
+	// The window with the LOWEST score wins.
 	bestStart := 0
-	bestSpread := int32(MaxMMR + 1)
+	bestScore := float64(MaxMMR+1) * 10 // sentinel: impossibly high
+
 	for i := 0; i <= len(candidates)-PlayersPerMatch; i++ {
-		spread := candidates[i+PlayersPerMatch-1].MMR - candidates[i].MMR
-		if spread < bestSpread {
-			bestSpread = spread
+		spread := float64(candidates[i+PlayersPerMatch-1].MMR - candidates[i].MMR)
+
+		// Compute average wait time for the window.
+		var totalWaitSec float64
+		for j := i; j < i+PlayersPerMatch; j++ {
+			totalWaitSec += now.Sub(candidates[j].EnqueuedAt).Seconds()
+		}
+		avgWait := totalWaitSec / float64(PlayersPerMatch)
+
+		// Lower score = better: tight spread is good, long waits make score lower.
+		score := spread - (avgWait * WaitWeight)
+
+		if score < bestScore {
+			bestScore = score
 			bestStart = i
 		}
 	}
@@ -267,9 +347,12 @@ func (p *Pool) ExtractMatch() ([]*QueuedPlayer, bool) {
 		delete(p.players, qp.PlayerID)
 	}
 
+	mmrSpread := selected[PlayersPerMatch-1].MMR - selected[0].MMR
+
 	slog.Info("match extracted",
 		"count", PlayersPerMatch,
-		"mmr_spread", bestSpread,
+		"mmr_spread", mmrSpread,
+		"weighted_score", bestScore,
 		"pool_remaining", len(p.players),
 	)
 
@@ -295,13 +378,29 @@ func insertSorted(s []*QueuedPlayer, qp *QueuedPlayer) []*QueuedPlayer {
 
 // removeFromSlice removes the first player with the given ID.
 // Preserves order (stable removal). O(N) but N is bounded by bracket population.
+//
+// Memory management: after removal, if the slice length has dropped below 1/4
+// of its capacity, we allocate a new smaller backing array and copy the data.
+// This prevents long-term memory leaks where a bracket slice grew large during
+// peak load (e.g., cap=1000) but now only holds a few players (len=20).
+// The old backing array becomes unreachable and will be collected by the GC.
 func removeFromSlice(s []*QueuedPlayer, id string) []*QueuedPlayer {
 	for i, qp := range s {
 		if qp.PlayerID == id {
-			// Remove without allocating a new slice.
+			// Remove element, preserving order.
 			copy(s[i:], s[i+1:])
-			s[len(s)-1] = nil // allow GC of the pointer
-			return s[:len(s)-1]
+			s[len(s)-1] = nil // nil the dangling pointer so GC can collect the QueuedPlayer
+			s = s[:len(s)-1]
+
+			// Shrink check: if capacity is 4x larger than length AND there are
+			// elements remaining, reallocate to free the oversized backing array.
+			if newLen := len(s); newLen > 0 && newLen < cap(s)/4 {
+				shrunk := make([]*QueuedPlayer, newLen)
+				copy(shrunk, s)
+				return shrunk
+			}
+
+			return s
 		}
 	}
 	return s
