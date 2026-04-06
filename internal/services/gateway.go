@@ -200,12 +200,15 @@ func (g *GatewayServer) EnterMatchmaking(stream grpc.BidiStreamingServer[pb.Gate
 			// Signal acceptance (or not) to the coordinator.
 			if accepted {
 				select {
-				case evt.AcceptCh <- struct{}{}:
+				case evt.ResponseCh <- true:
+				default:
+				}
+			} else {
+				select {
+				case evt.ResponseCh <- false:
 				default:
 				}
 			}
-			// If not accepted, AcceptCh is simply never written to;
-			// the coordinator detects this via its own timeout.
 
 			if !accepted {
 				// Notify client of cancellation.

@@ -97,9 +97,9 @@ type MatchEvent struct {
 	PlayerIDs []string
 	CreatedAt time.Time
 
-	// AcceptCh: gateway → coordinator. Buffered(1) so the gateway
-	// never blocks even if the coordinator hasn't started reading.
-	AcceptCh chan struct{}
+	// ResponseCh: gateway → coordinator. Buffered(1).
+	// Gateway pushes true when client accepts, false when client disconnects/declines.
+	ResponseCh chan bool
 
 	// ResultCh: coordinator → gateways. The coordinator sends exactly one
 	// bool (true=confirmed, false=cancelled), then closes the channel.

@@ -10,8 +10,8 @@ package services
 
 import (
 	"context"
+	"errors"
 	"log/slog"
-	"strings"
 
 	pb "nexus-match/pkg/pb"
 	"nexus-match/internal/state"
@@ -75,14 +75,13 @@ func (t *TrackerServer) SubmitResult(
 			"player_id", req.PlayerId,
 			"err", err,
 		)
-		// Map domain errors to gRPC codes using standard library.
-		errMsg := err.Error()
+		// Map domain errors to gRPC codes using standard errors.Is.
 		switch {
-		case strings.Contains(errMsg, "not found"):
+		case errors.Is(err, state.ErrSessionNotFound):
 			return nil, status.Errorf(codes.NotFound, "%v", err)
-		case strings.Contains(errMsg, "not part of session"):
+		case errors.Is(err, state.ErrPlayerNotInSession):
 			return nil, status.Errorf(codes.PermissionDenied, "%v", err)
-		case strings.Contains(errMsg, "already submitted"):
+		case errors.Is(err, state.ErrDuplicateSubmission):
 			return nil, status.Errorf(codes.AlreadyExists, "%v", err)
 		default:
 			return nil, status.Errorf(codes.Internal, "%v", err)

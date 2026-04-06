@@ -14,10 +14,21 @@
 package state
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
+)
+
+// ─────────────────────────────────────────────────────────────
+// Sentinel Errors
+// ─────────────────────────────────────────────────────────────
+
+var (
+	ErrSessionNotFound     = errors.New("session not found")
+	ErrPlayerNotInSession  = errors.New("player not part of session")
+	ErrDuplicateSubmission = errors.New("player already submitted result")
 )
 
 // ─────────────────────────────────────────────────────────────
@@ -97,7 +108,7 @@ func (ss *SessionStore) RecordResult(sessionID, playerID string, result int32, s
 
 	session, ok := ss.sessions[sessionID]
 	if !ok {
-		return 0, fmt.Errorf("session %s not found", sessionID)
+		return 0, fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
 	}
 
 	// Check that the player actually belongs to this session.
@@ -109,12 +120,12 @@ func (ss *SessionStore) RecordResult(sessionID, playerID string, result int32, s
 		}
 	}
 	if !found {
-		return 0, fmt.Errorf("player %s is not part of session %s", playerID, sessionID)
+		return 0, fmt.Errorf("%w: %s in session %s", ErrPlayerNotInSession, playerID, sessionID)
 	}
 
 	// Prevent duplicate submissions.
 	if _, dup := session.Results[playerID]; dup {
-		return 0, fmt.Errorf("player %s already submitted result for session %s", playerID, sessionID)
+		return 0, fmt.Errorf("%w: %s for session %s", ErrDuplicateSubmission, playerID, sessionID)
 	}
 
 	// Compute MMR delta.

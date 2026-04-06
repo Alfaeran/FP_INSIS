@@ -130,22 +130,23 @@ func (m *MatchmakerServer) tick() {
 			playerIDs[i] = p.PlayerID
 		}
 
-		// Create per-player AcceptCh channels and a shared ResultCh.
-		resultCh := make(chan bool, 1)
-		acceptChannels := make([]chan struct{}, len(players))
+		// Create per-player ResponseCh channels and per-player ResultCh channels.
+		resultChannels := make([]chan bool, len(players))
+		responseChannels := make([]chan bool, len(players))
 
 		for i := range players {
-			acceptChannels[i] = make(chan struct{}, 1)
+			responseChannels[i] = make(chan bool, 1)
+			resultChannels[i] = make(chan bool, 1)
 		}
 
-		// Build MatchEvents with shared ResultCh but individual AcceptCh.
+		// Build MatchEvents with individual ResponseCh and ResultCh.
 		for i, p := range players {
 			evt := state.MatchEvent{
-				SessionID: sessionID,
-				PlayerIDs: playerIDs,
-				CreatedAt: now,
-				AcceptCh:  acceptChannels[i],
-				ResultCh:  resultCh,
+				SessionID:  sessionID,
+				PlayerIDs:  playerIDs,
+				CreatedAt:  now,
+				ResponseCh: responseChannels[i],
+				ResultCh:   resultChannels[i],
 			}
 
 			select {
@@ -163,7 +164,7 @@ func (m *MatchmakerServer) tick() {
 		// Launch the ready-check coordinator in a separate goroutine.
 		// It is tracked by m.wg so StopWorker waits for it.
 		m.wg.Add(1)
-		go m.readyCheckCoordinator(sessionID, players, acceptChannels, resultCh)
+		go m.readyCheckCoordinator(sessionID, players, responseChannels, resultChannels)
 
 		m.counterMu.Lock()
 		m.matchesCreated++
@@ -182,53 +183,84 @@ func (m *MatchmakerServer) tick() {
 // Ready Check Coordinator
 // ─────────────────────────────────────────────────────────────
 
-// readyCheckCoordinator waits for all players to accept within the timeout.
-// On success, it creates the session. On failure, it re-enqueues players
-// who accepted and notifies everyone via resultCh.
+// readyCheckCoordinator uses a fan-in pattern to wait for all players simultaneously.
+// On success (all 10 true), it creates the session. On failure (ANY false or timeout),
+// it FAST-FAILS immediately, aborting the room and re-enqueuing players who accepted.
 //
 // This goroutine holds NO locks while waiting. All pool/session operations
 // are short, single-frame lock acquisitions.
 func (m *MatchmakerServer) readyCheckCoordinator(
 	sessionID string,
 	players []*state.QueuedPlayer,
-	acceptChannels []chan struct{},
-	resultCh chan bool,
+	responseChannels []chan bool,
+	resultChannels []chan bool,
 ) {
 	defer m.wg.Done()
 
 	ctx, cancel := context.WithTimeout(context.Background(), readyCheckCoordTimeout)
 	defer cancel()
 
+	type fanInResp struct {
+		idx      int
+		accepted bool
+	}
+	fanInCh := make(chan fanInResp, len(players))
+
+	// Fan-in: launch one goroutine per player to listen to their ResponseCh
+	// concurrently. This prevents index 0 from holding the coordinator hostage.
+	for i, ch := range responseChannels {
+		go func(index int, respCh chan bool) {
+			select {
+			case val := <-respCh:
+				fanInCh <- fanInResp{idx: index, accepted: val}
+			case <-ctx.Done():
+				// Main coordinator timeout triggered. Send false.
+				fanInCh <- fanInResp{idx: index, accepted: false}
+			}
+		}(i, ch)
+	}
+
 	accepted := make([]bool, len(players))
 	allAccepted := true
+	responsesReceived := 0
 
-	// Wait for each player sequentially within the shared timeout.
-	// Because all players have the same deadline, the total wait is bounded
-	// by readyCheckCoordTimeout regardless of order.
-	for i, ch := range acceptChannels {
+	// Gather responses as they arrive.
+	for responsesReceived < len(players) {
 		select {
-		case <-ch:
-			accepted[i] = true
-			slog.Info("matchmaker: player accepted",
-				"player_id", players[i].PlayerID,
-				"session_id", sessionID,
-			)
-		case <-ctx.Done():
-			// Timeout reached — remaining players have not accepted.
-			allAccepted = false
-			slog.Warn("matchmaker: ready-check timeout",
-				"player_id", players[i].PlayerID,
-				"session_id", sessionID,
-			)
-			// Mark remaining as not accepted and break out.
-			for j := i; j < len(players); j++ {
-				accepted[j] = false
+		case resp := <-fanInCh:
+			responsesReceived++
+			accepted[resp.idx] = resp.accepted
+
+			if resp.accepted {
+				slog.Info("matchmaker: player accepted",
+					"player_id", players[resp.idx].PlayerID,
+					"session_id", sessionID,
+				)
+			} else {
+				// FAST FAIL! Someone actively declined or disconnected.
+				// We do not wait for the others.
+				allAccepted = false
+				slog.Warn("matchmaker: fast-fail ready check (player declined)",
+					"player_id", players[resp.idx].PlayerID,
+					"session_id", sessionID,
+				)
+				goto verdict
 			}
+		case <-ctx.Done():
+			// Timeout reached. Anyone who hasn't answered is considered false.
+			allAccepted = false
+			slog.Warn("matchmaker: room fast-fail (timeout)",
+				"session_id", sessionID,
+			)
 			goto verdict
 		}
 	}
 
 verdict:
+	// Cancel the context early to free the remaining fan-in goroutines
+	// if we fast-failed before they finished.
+	cancel()
+
 	if allAccepted {
 		// All 10 players accepted → create the session.
 		m.sessions.CreateSession(sessionID, func() []string {
@@ -245,8 +277,10 @@ verdict:
 		)
 
 		// Notify all gateways: room confirmed.
-		resultCh <- true
-		close(resultCh)
+		for _, ch := range resultChannels {
+			ch <- true
+			close(ch)
+		}
 		return
 	}
 
@@ -256,8 +290,10 @@ verdict:
 	)
 
 	// Notify all gateways: room cancelled.
-	resultCh <- false
-	close(resultCh)
+	for _, ch := range resultChannels {
+		ch <- false
+		close(ch)
+	}
 
 	// Re-enqueue players who DID accept. They should not lose their
 	// queue position or their open channels.
